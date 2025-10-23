@@ -1,0 +1,213 @@
+import re, json, asyncio, httpx, streamlit as st
+
+st.set_page_config(page_title="Minutes of Meeting Generator", layout="wide")
+
+# ----------------- Settings via Streamlit Secrets -----------------
+BACKEND = (st.secrets.get("LLM_BACKEND") or "groq").lower()
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
+GROQ_MODEL   = st.secrets.get("GROQ_MODEL", "llama-3.1-8b-instant")
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
+GEMINI_MODEL   = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
+
+# ----------------- VTT parsing & chunking (minimal) -----------------
+CUE_RE = re.compile(r"(?P<start>\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2}\.\d{3})")
+SPEAKER_COLON = re.compile(r"^\s*([A-Z][\w .'\-]{0,40}):\s*(.*)$")
+
+def parse_vtt(raw: str):
+    lines = raw.splitlines()
+    out, i = [], 0
+    while i < len(lines):
+        m = CUE_RE.match(lines[i].strip())
+        if not m:
+            i += 1
+            continue
+        start, end = m.groups()
+        j = i + 1
+        texts = []
+        while j < len(lines) and lines[j].strip() != "" and not CUE_RE.match(lines[j]):
+            texts.append(lines[j].strip())
+            j += 1
+        text = " ".join(texts)
+        spkr, body = None, text
+        m1 = SPEAKER_COLON.match(text)
+        if m1:
+            spkr, body = m1.group(1), m1.group(2)
+        out.append({"start": start, "end": end, "speaker": spkr, "text": body})
+        i = j
+    return out
+
+def _sec(ts): h,m,s = ts.split(":"); s,ms = s.split("."); return int(h)*3600+int(m)*60+int(s)+int(ms)/1000
+def merge_short(segs, gap=3):
+    merged=[]
+    for s in segs:
+        if merged and s["speaker"]==merged[-1]["speaker"]:
+            if 0 <= _sec(s["start"]) - _sec(merged[-1]["end"]) <= gap:
+                merged[-1]["end"]=s["end"]; merged[-1]["text"]+=" "+s["text"]; continue
+        merged.append(s)
+    return merged
+
+def chunk(segs, window=480, overlap=30):
+    if not segs: return []
+    start_all, end_all = _sec(segs[0]["start"]), _sec(segs[-1]["end"])
+    out=[]; cur=start_all
+    while cur < end_all:
+        wend = cur + window
+        items = [s for s in segs if _sec(s["start"]) < wend and _sec(s["end"]) > cur]
+        out.append({"start":cur,"end":min(wend,end_all),"items":items})
+        cur = wend - overlap
+    return out
+
+def fmt_chunk(ch):
+    lines=[]
+    for s in ch["items"]:
+        sp = s["speaker"] or "Unknown"
+        lines.append(f'[{s["start"]}] {sp}: {s["text"]}')
+    return "\n".join(lines)
+
+# ----------------- Prompt (detailed discussion + crisp actions) -----------------
+def build_prompt(chunk_text: str) -> str:
+    return f"""
+You are a professional business meeting summarizer.
+
+Your goal is to generate structured minutes of meeting in detailed yet clear form.
+
+Return JSON in this structure:
+{{
+  "topics": [
+    {{
+      "title": "string",
+      "discussion": [
+        "Detailed bullet capturing what was said, the reasoning, decisions, and relevant context."
+      ],
+      "actions": [
+        {{"task": "short imperative action ≤ 20 words", "owner": "person/team or Unassigned", "due": "date if given or null"}}
+      ]
+    }}
+  ]
+}}
+
+Guidelines:
+- Discussion bullets should be rich and explanatory (who said what, why, context, decisions).
+- Actions must be crisp, imperative, and omit rationale (keep rationale in discussion).
+- Only include owners/dates when explicitly stated; otherwise owner="Unassigned", due=null.
+- Do not invent facts.
+
+Transcript:
+{chunk_text}
+"""
+
+# ----------------- LLM calls -----------------
+async def call_groq(prompt: str):
+    if not GROQ_API_KEY:
+        raise RuntimeError("Missing GROQ_API_KEY in Streamlit Secrets.")
+    payload = {
+        "model": GROQ_MODEL,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role":"system","content":"Return ONLY valid JSON."},
+            {"role":"user","content": prompt}
+        ],
+        "temperature": 0.2
+    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    async with httpx.AsyncClient(timeout=90) as client:
+        r = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+        r.raise_for_status()
+        txt = r.json()["choices"][0]["message"]["content"]
+        return json.loads(txt)
+
+async def call_gemini(prompt: str):
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("Missing GOOGLE_API_KEY in Streamlit Secrets.")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    payload = {
+        "contents":[{"parts":[{"text": prompt + "\n\nReturn valid JSON only."}]}],
+        "generationConfig":{"temperature":0.2,"responseMimeType":"application/json"}
+    }
+    headers = {"x-goog-api-key": GOOGLE_API_KEY}
+    async with httpx.AsyncClient(timeout=90) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        txt = data["candidates"][0]["content"]["parts"][0]["text"]
+        return json.loads(txt)
+
+async def extract_topics(chunks):
+    async def run(c):
+        prompt = build_prompt(fmt_chunk(c))
+        try:
+            if BACKEND == "gemini":
+                return await call_gemini(prompt)
+            return await call_groq(prompt)
+        except Exception:
+            return {"topics": []}
+    results = await asyncio.gather(*[run(c) for c in chunks])
+    topics = [t for r in results for t in r.get("topics", [])]
+    return topics
+
+# ----------------- UI -----------------
+st.title("📋 Minutes of Meeting (Streamlit, no backend)")
+
+col1, col2 = st.columns([2,1], vertical_alignment="bottom")
+with col1:
+    meeting_title = st.text_input("Meeting title", "Project Discussion")
+with col2:
+    st.write("Backend:")
+    st.code(f"{BACKEND.upper()} :: model={GROQ_MODEL if BACKEND=='groq' else GEMINI_MODEL}", language="text")
+
+vtt = st.file_uploader("Upload .vtt transcript", type=["vtt"])
+
+if st.button("Generate Minutes", type="primary") and vtt:
+    raw = vtt.getvalue().decode("utf-8", "ignore")
+    segs = merge_short(parse_vtt(raw))
+    if not segs:
+        st.error("No cues found in file.")
+    else:
+        duration_min = int(round((_sec(segs[-1]['end']) - _sec(segs[0]['start']))/60))
+        chs = chunk(segs, window=480, overlap=30)
+        with st.spinner("Summarizing..."):
+            topics = asyncio.run(extract_topics(chs))
+        # Render
+        st.subheader("Structured Summary")
+        for i, t in enumerate(topics, 1):
+            with st.expander(f"{i}. {t.get('title','(untitled)')}", expanded=(i==1)):
+                for d in t.get("discussion", []):
+                    st.markdown(f"- {d}")
+                if t.get("actions"):
+                    st.markdown("**Actions**")
+                    for a in t["actions"]:
+                        task = a.get("task","")
+                        own  = a.get("owner","Unassigned")
+                        due  = a.get("due") or "-"
+                        st.write(f"- **{task}** — Owner: *{own}* (Due: {due})")
+
+        # Email draft
+        st.divider()
+        st.subheader("✉️ Email Draft")
+        lines = [
+            f"Subject: Minutes of Meeting – {meeting_title}",
+            "",
+            "Please find the meeting minutes below:",
+            "",
+            "**Key Discussion Points, Actions & Decisions -**",
+            ""
+        ]
+        for t in topics:
+            lines.append(f"**{t.get('title','(untitled)')}**")
+            for d in t.get("discussion", []):
+                lines.append(f"*   {d}")
+            for a in t.get("actions", []):
+                task=a.get("task",""); own=a.get("owner","Unassigned"); due=a.get("due") or "-"
+                lines.append(f"*   **[Action] {task} — Owner: {own}, Due: {due}.**")
+            lines.append("")
+        lines.append("Regards,\nAutomated MoM Assistant")
+
+        draft = "\n".join(lines)
+        st.text_area("Email Draft", value=draft, height=380)
+        st.download_button("Download minutes.json",
+                           data=json.dumps({"meeting_title": meeting_title,
+                                            "duration_min": duration_min,
+                                            "topics": topics,
+                                            "email_draft": draft}, indent=2),
+                           file_name="minutes.json",
+                           mime="application/json")
