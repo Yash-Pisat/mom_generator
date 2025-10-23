@@ -2,17 +2,17 @@ import re, json, asyncio, httpx, streamlit as st
 
 st.set_page_config(page_title="Minutes of Meeting Generator", layout="wide")
 
-# ----- Secrets (set in Streamlit Cloud: Settings → Secrets) -----
+# ----- Secrets (Streamlit Cloud: Settings → Secrets) -----
 # Required:
-#   GOOGLE_API_KEY = "your_gemini_api_key"
+#   GROQ_API_KEY = "your_groq_api_key"
 # Optional:
-#   GEMINI_MODEL   = "gemini-1.5-flash"  (default below)
-#   DEBUG          = "true" to show raw error details in UI
-GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY")
-GEMINI_MODEL   = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")
-DEBUG          = (st.secrets.get("DEBUG") or "false").lower() == "true"
+#   GROQ_MODEL   = "llama-3.1-8b-instant" (default below)
+#   DEBUG        = "true" to print raw exceptions
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
+GROQ_MODEL   = st.secrets.get("GROQ_MODEL", "llama-3.1-8b-instant")
+DEBUG        = (st.secrets.get("DEBUG") or "false").lower() == "true"
 
-# ----- VTT parsing & chunking (minimal, no extra packages) -----
+# ----- VTT parsing & chunking (minimal) -----
 CUE_RE = re.compile(r"(?P<start>\d{2}:\d{2}:\d{2}\.\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2}\.\d{3})")
 SPEAKER_COLON = re.compile(r"^\s*([A-Z][\w .'\-]{0,40}):\s*(.*)$")
 
@@ -39,7 +39,10 @@ def parse_vtt(raw: str):
         i = j
     return out
 
-def _sec(ts): h,m,s = ts.split(":"); s,ms = s.split("."); return int(h)*3600+int(m)*60+int(s)+int(ms)/1000
+def _sec(ts): 
+    h,m,s = ts.split(":"); s,ms = s.split(".")
+    return int(h)*3600 + int(m)*60 + int(s) + int(ms)/1000
+
 def merge_short(segs, gap=3):
     merged=[]
     for s in segs:
@@ -49,7 +52,7 @@ def merge_short(segs, gap=3):
         merged.append(s)
     return merged
 
-def chunk(segs, window=360, overlap=20):  # slightly smaller windows to avoid token limits
+def chunk(segs, window=360, overlap=20):  # 6-min windows to reduce token risk
     if not segs: return []
     start_all, end_all = _sec(segs[0]["start"]), _sec(segs[-1]["end"])
     out=[]; cur=start_all
@@ -99,60 +102,62 @@ Transcript:
 {chunk_text}
 """
 
-# ----- Gemini call with robust error reporting -----
-def _gemini_error_text(resp_json: dict) -> str:
+# ----- Groq call with robust error reporting -----
+def _groq_error_text(resp_json: dict) -> str:
     if resp_json is None:
         return "Unknown error (no response body)."
-    parts = []
-    if "promptFeedback" in resp_json:
-        pf = resp_json["promptFeedback"]
-        if pf.get("blockReason"):
-            parts.append(f"Blocked: {pf.get('blockReason')}")
-        if pf.get("safetyRatings"):
-            cats = [r.get("category","") for r in pf["safetyRatings"] if r.get("probability")]
-            if cats: parts.append("Safety: " + ", ".join(cats))
-    if "error" in resp_json:
-        e = resp_json["error"]
-        parts.append(f"{e.get('status','ERROR')}: {e.get('message','')}")
-    if not parts and not resp_json.get("candidates"):
-        parts.append("No candidates returned (quota/tokens/size?).")
-    return " | ".join(parts) or "Unspecified Gemini error."
+    try:
+        # OpenAI-compatible error shape
+        err = resp_json.get("error")
+        if err:
+            return f"{err.get('type','error').upper()}: {err.get('message','')}"
+    except Exception:
+        pass
+    # Fallback raw
+    try:
+        return json.dumps(resp_json)[:500]
+    except Exception:
+        return "Unspecified Groq error."
 
-async def call_gemini(prompt: str):
-    if not GOOGLE_API_KEY:
-        return None, "GOOGLE_API_KEY is missing in Streamlit Secrets."
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+async def call_groq(prompt: str):
+    if not GROQ_API_KEY:
+        return None, "GROQ_API_KEY is missing in Streamlit Secrets."
     payload = {
-        "contents":[{"parts":[{"text": prompt + "\n\nReturn valid JSON only."}]}],
-        "generationConfig":{"temperature":0.2,"responseMimeType":"application/json"}
+        "model": GROQ_MODEL,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role":"system","content":"Return ONLY valid JSON."},
+            {"role":"user","content": prompt}
+        ],
+        "temperature": 0.2
     }
-    headers = {"x-goog-api-key": GOOGLE_API_KEY}
-    async with httpx.AsyncClient(timeout=120) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        if r.status_code >= 400:
-            try:
-                body = r.json()
-            except Exception:
-                body = None
-            return None, f"HTTP {r.status_code}: {_gemini_error_text(body)}"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(url, headers=headers, json=payload)
+    except Exception as e:
+        if DEBUG: st.exception(e)
+        return None, f"Network error calling Groq: {repr(e)}"
+    if r.status_code >= 400:
         try:
-            data = r.json()
-            cands = data.get("candidates") or []
-            if not cands:
-                return None, _gemini_error_text(data)
-            txt = cands[0]["content"]["parts"][0]["text"]
-            return json.loads(txt), None
-        except Exception as e:
-            if DEBUG:
-                st.exception(e)
-            return None, f"Parse error: {repr(e)} (model returned non-JSON?)"
+            body = r.json()
+        except Exception:
+            body = None
+        return None, f"HTTP {r.status_code}: {_groq_error_text(body)}"
+    try:
+        txt = r.json()["choices"][0]["message"]["content"]
+        return json.loads(txt), None
+    except Exception as e:
+        if DEBUG: st.exception(e)
+        return None, f"Parse error: {repr(e)} (model returned non-JSON?)"
 
 # ----- Extraction orchestration (collects errors) -----
 async def extract_topics(chunks):
     topics, errors = [], []
     async def run(c):
         prompt = build_prompt(fmt_chunk(c))
-        result, err = await call_gemini(prompt)
+        result, err = await call_groq(prompt)
         if err: errors.append(err)
         return result or {"topics": []}
     results = await asyncio.gather(*[run(c) for c in chunks])
@@ -224,7 +229,7 @@ if st.button("Generate Minutes", type="primary") and vtt:
     st.text_area("Email Draft", value=draft, height=380)
 
     if errors:
-        st.error("Gemini reported the following issue(s):")
+        st.error("LLM reported the following issue(s):")
         for e in errors:
             st.write(f"- {e}")
         if DEBUG:
